@@ -51,6 +51,9 @@ class DroneDetector():
         overlap_width_ratio: float = 0.15,
         sahi_threshold: int = 1280,
         min_motion_area: int = 200,
+        motion_roi_downscale: float = 0.5,
+        max_rois: int = 4,
+        motion_roi_grayscale: bool = True,
         conf_threshold: float = 0.25,
         iou_threshold: float = 0.45,
         device: str | None = None,
@@ -68,6 +71,9 @@ class DroneDetector():
             overlap_height_ratio, overlap_width_ratio: SAHI overlap (0.1-0.2).
             sahi_threshold: Use SAHI when frame width or height > this (even if use_sahi=False).
             min_motion_area: Min contour area (pixels^2) for MOG2 ROIs.
+            motion_roi_downscale: Run MOG2 on frame scaled by this (e.g. 0.5 = half size); ROIs scaled back.
+            max_rois: Max number of motion ROIs to run YOLO on (keeps largest by area).
+            motion_roi_grayscale: Run MOG2 on grayscale input for speed.
             conf_threshold: YOLO confidence threshold.
             iou_threshold: YOLO IoU threshold.
             device: 'cuda:0', 'cpu', etc.
@@ -83,6 +89,9 @@ class DroneDetector():
         self.overlap_width_ratio = overlap_width_ratio
         self.sahi_threshold = sahi_threshold
         self.min_motion_area = min_motion_area
+        self.motion_roi_downscale = max(0.25, min(1.0, motion_roi_downscale))
+        self.max_rois = max(1, max_rois)
+        self.motion_roi_grayscale = motion_roi_grayscale
         self.conf_threshold = conf_threshold
         self.iou_threshold = iou_threshold
         self.device = device if device is not None else str(DEVICE)
@@ -104,23 +113,61 @@ class DroneDetector():
         self._motion_roi_fallback_counter = 0
 
     def _get_motion_rois(self, frame: np.ndarray) -> list[tuple[int, int, int, int]]:
-        """Return list of (x, y, w, h) rectangles for moving regions."""
-        fgmask = self._mog2.apply(frame)
+        """Return list of (x, y, w, h) rectangles for moving regions.
+        Optionally runs MOG2 on a downscaled grayscale image for speed, then scales ROIs back.
+        """
+        h_full, w_full = frame.shape[:2]
+        scale = self.motion_roi_downscale
+        if scale < 1.0:
+            w_small = max(1, int(w_full * scale))
+            h_small = max(1, int(h_full * scale))
+            work = cv2.resize(frame, (w_small, h_small), interpolation=cv2.INTER_LINEAR)
+        else:
+            work = frame
+
+        if self.motion_roi_grayscale and len(work.shape) == 3:
+            work = cv2.cvtColor(work, cv2.COLOR_BGR2GRAY)
+
+        fgmask = self._mog2.apply(work)
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
         fgmask = cv2.morphologyEx(fgmask, cv2.MORPH_OPEN, kernel)
         fgmask = cv2.morphologyEx(fgmask, cv2.MORPH_CLOSE, kernel)
         contours, _ = cv2.findContours(fgmask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         rois = []
-        
+
         for c in contours:
             area = cv2.contourArea(c)
-            
             if area < self.min_motion_area:
                 continue
-            
             x, y, w, h = cv2.boundingRect(c)
             rois.append((x, y, w, h))
-            
+
+        if scale < 1.0 and rois:
+            inv = 1.0 / scale
+            rois = [
+                (
+                    int(x * inv),
+                    int(y * inv),
+                    max(1, int(w * inv)),
+                    max(1, int(h * inv)),
+                )
+                for x, y, w, h in rois
+            ]
+            # Clamp to frame
+            rois = [
+                (
+                    max(0, min(x, w_full - 1)),
+                    max(0, min(y, h_full - 1)),
+                    max(1, min(w, w_full - x)),
+                    max(1, min(h, h_full - y)),
+                )
+                for x, y, w, h in rois
+            ]
+
+        # Keep only the largest ROIs by area to bound inference cost
+        if len(rois) > self.max_rois:
+            rois = sorted(rois, key=lambda r: r[2] * r[3], reverse=True)[: self.max_rois]
+
         return rois
 
     def _merge_overlapping_rois(self, rois: list[tuple[int, int, int, int]], pad: int = 64) -> list[tuple[int, int, int, int]]:

@@ -30,6 +30,8 @@ def main():
     detector = DroneDetector(model_path=Path("models/yolo11s.pt"), model_size="s", use_sahi=False, use_motion_roi=True, slice_height=896, slice_width=896, imgsz=320, half=True)
 
     cached_detections: list[tuple[float, float, float, float, float]] = []
+    frame_index = 0
+    detect_every_n = 1  # Set to 2+ to run detector every N frames (use cache on others for higher FPS)
 
     while True:
         start_time = time.time()
@@ -38,8 +40,10 @@ def main():
         if frame is None:
             break
 
-        detections = detector.detect(frame)
-        
+        run_detector = detect_every_n <= 1 or (frame_index % detect_every_n) == 0
+        detections = detector.detect(frame) if run_detector else []
+        frame_index += 1
+
         if detections:
             cached_detections = detections
         else:
