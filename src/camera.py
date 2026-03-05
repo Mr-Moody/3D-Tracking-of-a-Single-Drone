@@ -16,6 +16,8 @@ class Camera():
         K: Optional[np.ndarray] = None,
         dist_coeff: Optional[np.ndarray] = None,
         P: Optional[np.ndarray] = None,
+        fps: Optional[float] = None,
+        resolution: Optional[Tuple[int, int]] = None,
     ):
         self.filepath = filepath
         self.capture = None
@@ -24,6 +26,8 @@ class Camera():
         self.K = K if K is not None else np.eye(3)
         self.dist_coeff = dist_coeff if dist_coeff is not None else np.zeros(5)
         self.P = P  # 3x4 projection matrix; must be set for project/projection_jacobian
+        self.fps = fps
+        self.resolution = resolution  # (width, height) from calibration if available
 
     def load_from_file(self) -> None:
         if self.filepath is None:
@@ -113,16 +117,88 @@ class Camera():
         
         return float(undistorted_points[0, 0, 0]), float(undistorted_points[0, 0, 1])
 
+    def estimate_distance_to_bbox(
+        self, x1: float, y1: float, x2: float, y2: float, real_width_m: float
+    ) -> Optional[float]:
+        """Estimate distance in metres to an object of known width from its bounding box (pinhole model).
+
+        Returns None if the camera is uncalibrated (K is identity-like or fx is 0).
+        """
+        fx = float(self.K[0, 0])
+
+        if fx <= 0 or abs(fx - 1.0) < 1e-6:
+            return None
+
+        bbox_width_px = max(1.0, x2 - x1)
+
+        return (fx * real_width_m) / bbox_width_px
+
+    def back_project_to_3d(self, u: float, v: float, depth: float) -> Optional[np.ndarray]:
+        """Back-project pixel (u, v) with given depth to 3D point in camera frame.
+
+        Returns None if K is invalid (e.g. identity) or depth <= 0.
+        """
+        if depth <= 0:
+            return None
+        fx = float(self.K[0, 0])
+        if fx <= 0 or abs(fx - 1.0) < 1e-6:
+            return None
+        ray = np.linalg.inv(self.K) @ np.array([u, v, 1.0], dtype=np.float64)
+        if abs(ray[2]) < 1e-10:
+            return None
+        scale = depth / ray[2]
+        point_camera = scale * ray
+        return point_camera
+
+    def camera_to_world(self, point_camera: np.ndarray) -> np.ndarray:
+        """Transform 3D point from camera frame to world frame using P = K[R|t].
+
+        Requires self.P to be set. World point X satisfies p_c = R @ X + t, so X = R.T @ (p_c - t).
+        """
+        if self.P is None:
+            raise ValueError("Projection matrix P not set")
+        Rt = np.linalg.inv(self.K) @ self.P
+        R = Rt[:3, :3]
+        t = Rt[:3, 3]
+        point_camera = np.asarray(point_camera, dtype=np.float64).ravel()[:3]
+        return (R.T @ (point_camera - t)).reshape(3)
+
     @classmethod
-    def from_calibration_json(cls, calib_path: Path, P: np.ndarray, video_path: Optional[Path] = None) -> "Camera":
-        """Create camera from calibration JSON and given projection matrix P (3x4)."""
+    def from_calibration_json(
+        cls,
+        calib_path: Path,
+        P: Optional[np.ndarray] = None,
+        video_path: Optional[Path] = None,
+    ) -> "Camera":
+        """Create camera from calibration JSON. P (3x4) is optional; if present in JSON it is used."""
         with open(calib_path, encoding="utf-8") as f:
             data = json.load(f)
-            
+
         K = np.array(data["K-matrix"], dtype=np.float64)
         dist_coeff = np.array(data["distCoeff"], dtype=np.float64)
-        
-        return cls(filepath=video_path, K=K, dist_coeff=dist_coeff, P=np.asarray(P, dtype=np.float64))
+        P_val = data.get("P")
+        if P_val is not None:
+            P_use = np.asarray(P_val, dtype=np.float64)
+        else:
+            P_use = np.asarray(P, dtype=np.float64) if P is not None else None
+
+        fps = data.get("fps")
+        if fps is not None:
+            fps = float(fps)
+        res = data.get("resolution")
+        if res is not None and len(res) >= 2:
+            resolution = (int(res[0]), int(res[1]))
+        else:
+            resolution = None
+
+        return cls(
+            filepath=video_path,
+            K=K,
+            dist_coeff=dist_coeff,
+            P=P_use,
+            fps=fps,
+            resolution=resolution,
+        )
 
     @classmethod
     def from_calibration_and_extrinsics(
@@ -152,6 +228,30 @@ class Camera():
         P = K @ Rt
         
         return cls(filepath=video_path, K=K, dist_coeff=dist_coeff, P=P)
+
+    @classmethod
+    def from_calibration_folder(
+        cls,
+        calibration_root: Path,
+        camera_type: str,
+        video_path: Optional[Path] = None,
+        P: Optional[np.ndarray] = None,
+    ) -> "Camera":
+        """Create camera from central calibration folder: calibration_root/camera_type/<camera_type>.json or first .json in folder."""
+        folder = calibration_root / camera_type
+        if not folder.is_dir():
+            raise FileNotFoundError(f"Calibration folder not found: {folder}")
+
+        preferred = folder / f"{camera_type}.json"
+        if preferred.exists():
+            calib_path = preferred
+        else:
+            jsons = sorted(folder.glob("*.json"))
+            if not jsons:
+                raise FileNotFoundError(f"No .json file in calibration folder: {folder}")
+            calib_path = jsons[0]
+
+        return cls.from_calibration_json(calib_path, P=P, video_path=video_path)
 
     @classmethod
     def from_mvus_pkl(cls, pkl_path: Path, cam_idx: int, video_path: Optional[Path] = None) -> "Camera":

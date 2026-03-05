@@ -141,6 +141,31 @@ class DroneTrackerEKF():
         
         self.P = I_KH @ self.P @ I_KH.T + K @ self.R @ K.T
 
+    def update_3d(
+        self,
+        position_3d: np.ndarray,
+        measurement_noise_std: Optional[float] = None,
+    ) -> None:
+        """Update state with a direct 3D position measurement (e.g. fused from multiple cameras)."""
+        z = np.asarray(position_3d, dtype=np.float64).ravel()[:3]
+        r = measurement_noise_std if measurement_noise_std is not None else np.sqrt(self._r)
+        R_3d = np.eye(3, dtype=np.float64) * (r * r)
+
+        H = np.zeros((3, 9), dtype=np.float64)
+        H[:, :3] = np.eye(3)
+
+        y = z - self.state[:3]
+        S = H @ self.P @ H.T + R_3d
+
+        try:
+            K_gain = self.P @ H.T @ np.linalg.inv(S)
+        except np.linalg.LinAlgError:
+            return
+
+        self.state = self.state + K_gain @ y
+        I_KH = np.eye(9) - K_gain @ H
+        self.P = I_KH @ self.P @ I_KH.T + K_gain @ R_3d @ K_gain.T
+
     def set_state(self, state: np.ndarray) -> None:
         """Set state vector [x,y,z,vx,vy,vz,ax,ay,az]."""
         self.state = np.asarray(state, dtype=np.float64).ravel()[:9].reshape(9)
